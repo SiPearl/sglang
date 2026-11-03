@@ -537,7 +537,7 @@ def get_available_gpu_memory(
             free_gpu_memory = min(get_numa_node_available_bytes(n) for n in nodes)
         else:
             # No NUMA information, e.g. on non-Linux systems
-            total_free_memory = psutil.virtual_memory().available
+            total_free_memory = get_free_cpu_memory()
             n_numa_node: int = len(get_cpu_ids_by_node())
             free_gpu_memory = round(total_free_memory / n_numa_node, 3)
     elif device == "npu":
