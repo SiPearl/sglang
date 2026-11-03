@@ -432,7 +432,7 @@ def empty_device_cache(device_module: Optional[Any] = None) -> bool:
 
 def get_numa_node_available_bytes(node: int) -> int:
     """
-    Estimate the available memory on a NUMA node in bytes.
+    Estimate the available memory on a NUMA node, in bytes.
 
     Node meminfo has no MemAvailable field, so this adds MemFree, file-backed
     page cache and reclaimable slab. The result can be slightly optimistic,
@@ -523,7 +523,6 @@ def get_available_gpu_memory(
     elif device == "cpu":
         # TODO: rename the variables in the current function to be not GPU specific
         mem_bind_env = os.environ.get("SGLANG_CPU_MEM_BIND", None)
-        # This file contain numa nodes with compute cores
         has_cpu_path = "/sys/devices/system/node/has_cpu"
         if mem_bind_env:
             nodes = parse_node_list(mem_bind_env)
@@ -537,7 +536,7 @@ def get_available_gpu_memory(
             free_gpu_memory = min(get_numa_node_available_bytes(n) for n in nodes)
         else:
             # No NUMA information, e.g. on non-Linux systems
-            total_free_memory = get_free_cpu_memory()
+            total_free_memory = psutil.virtual_memory().available
             n_numa_node: int = len(get_cpu_ids_by_node())
             free_gpu_memory = round(total_free_memory / n_numa_node, 3)
     elif device == "npu":
