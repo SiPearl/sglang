@@ -44,6 +44,7 @@ from sglang.srt.utils import (
     is_host_cpu_arm64,
     is_npu,
     monkey_patch_p2p_access_check,
+    parse_node_list,
 )
 from sglang.srt.utils.network import NetworkAddress
 from sglang.srt.utils.patch_torch import register_sgl_tp_rank
@@ -70,6 +71,49 @@ def reset_parallel_initialised() -> None:
     """Reset the initialization guard when model-parallel groups are destroyed."""
     global _PARALLEL_INITIALISED
     _PARALLEL_INITIALISED = False
+
+
+def _get_cpu_mem_bind_nodes() -> Optional[List[int]]:
+    spec = os.environ.get("SGLANG_CPU_MEM_BIND", None)
+    if not spec:
+        return None
+
+    parallel = get_parallel()
+    if parallel.nnodes != 1:
+        raise ValueError(
+            "SGLANG_CPU_MEM_BIND supports only single-machine execution "
+            f"(nnodes=1); got nnodes={parallel.nnodes}. "
+            "Multi-machine memory accounting is not supported."
+        )
+    if parallel.dp_size != 1:
+        raise ValueError(
+            "SGLANG_CPU_MEM_BIND does not support data-parallel replicas "
+            f"(dp_size={parallel.dp_size}): replicas load and profile memory "
+            "independently. Use dp_size=1 for this implementation."
+        )
+    if get_exec().moe.elastic_ep_backend is not None or get_exec().moe.is_ep_joiner:
+        raise ValueError("SGLANG_CPU_MEM_BIND does not support elastic EP launches.")
+    if not (_is_cpu_amx_available or _is_cpu_arm64):
+        raise ValueError("SGLANG_CPU_MEM_BIND requires the AMX or ARM64 binding path.")
+
+    nodes = parse_node_list(spec)
+    num_workers = parallel.tp_size * parallel.pp_size
+    if len(nodes) != num_workers:
+        raise ValueError(
+            f"SGLANG_CPU_MEM_BIND requires exactly {num_workers} distinct nodes "
+            f"for the local scheduler workers; got {len(nodes)}."
+        )
+
+    # Attention DP partitions TP and does not add scheduler processes.
+    expected_id = parallel.pp_rank * parallel.tp_size + parallel.tp_rank
+    gpu_id = get_device().gpu_id
+    if gpu_id != expected_id or not 0 <= gpu_id < num_workers:
+        raise ValueError(
+            "SGLANG_CPU_MEM_BIND requires contiguous scheduler IDs starting at 0; "
+            f"expected gpu_id={expected_id}, got {gpu_id}. "
+            "Check --base-gpu-id and --gpu-id-step."
+        )
+    return nodes
 
 
 def _bind_threads_if_cpu(*, device: str) -> "Optional[List[int]]":
@@ -109,6 +153,7 @@ def init_parallel_runtime(
             "through initialize_model_parallel directly and does not come "
             "through here."
         )
+    mem_bind_nodes = _get_cpu_mem_bind_nodes() if device == "cpu" else None
     _PARALLEL_INITIALISED = True
 
     tic = time.perf_counter()
@@ -141,6 +186,7 @@ def init_parallel_runtime(
         _init_cpu_threads_env(
             local_omp_cpuid=local_omp_cpuid,
             dist_init_method=dist_init_method,
+            mem_bind_nodes=mem_bind_nodes,
         )
 
     _init_parallel_groups(
@@ -272,33 +318,18 @@ def _init_cpu_threads_env(
     *,
     local_omp_cpuid: Optional[List[int]],
     dist_init_method: Optional[str] = None,
+    mem_bind_nodes: Optional[List[int]] = None,
 ) -> None:
     if _is_cpu_amx_available or _is_cpu_arm64:
         parallel = get_parallel()
         gpu_id = get_device().gpu_id
-        mem_bind_env = os.environ.get("SGLANG_CPU_MEM_BIND", None)
-        node_mem_bind = -1
-
-        if mem_bind_env:
-            nodes = [n.strip() for n in mem_bind_env.split(",") if n.strip()]
-            if len(nodes) == 1:
-                # Single node given (e.g. "8"): all ranks bind to node 8
-                node_mem_bind = int(nodes[0])
-            elif gpu_id < len(nodes):
-                # Multiple nodes given (e.g. "8,9"): rank 0 gets 8, rank 1 gets 9
-                node_mem_bind = int(nodes[gpu_id])
-            else:
-                logger.warning(
-                    "SGLANG_CPU_MEM_BIND has %d nodes, but gpu_id is %d. Using fallback.",
-                    len(nodes),
-                    gpu_id,
-                )
-
-        # Bind OpenMP threads to CPU cores and bind memory to the target NUMA node
-        if node_mem_bind < 0:
+        # Keep CPU-core binding separate from explicit memory-node binding.
+        if mem_bind_nodes is None:
             torch.ops.sgl_kernel.init_cpu_threads_env(local_omp_cpuid)
         else:
-            torch.ops.sgl_kernel.init_cpu_threads_env(local_omp_cpuid, node_mem_bind)
+            torch.ops.sgl_kernel.init_cpu_threads_env(
+                local_omp_cpuid, mem_bind_nodes[gpu_id]
+            )
 
         # Set local size to hint SGLang to use shared memory based AllReduce
         os.environ["LOCAL_SIZE"] = str(parallel.tp_size)

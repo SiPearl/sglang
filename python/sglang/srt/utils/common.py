@@ -449,11 +449,16 @@ def get_numa_node_available_bytes(node: int) -> int:
 
 
 def parse_node_list(spec: str) -> list[int]:
-    """Parse a node list such as "2", "2,3" or "0-1". Returns the list of nodes as integers."""
-    nodes = []
-    for part in spec.split(","):
-        start, _, end = part.strip().partition("-")
-        nodes.extend(range(int(start), int(end or start) + 1))
+    """Parse an ordered comma-separated list of distinct NUMA node IDs."""
+    parts = [part.strip() for part in spec.split(",")]
+    if not all(re.fullmatch(r"[0-9]+", part) for part in parts):
+        raise ValueError(
+            "SGLANG_CPU_MEM_BIND must contain comma-separated non-negative "
+            "node IDs, for example 8,9; ranges and empty entries are not supported."
+        )
+    nodes = [int(part) for part in parts]
+    if len(set(nodes)) != len(nodes):
+        raise ValueError("SGLANG_CPU_MEM_BIND requires distinct memory nodes.")
     return nodes
 
 
@@ -523,26 +528,18 @@ def get_available_gpu_memory(
     elif device == "cpu":
         # TODO: rename the variables in the current function to be not GPU specific
         mem_bind_env = os.environ.get("SGLANG_CPU_MEM_BIND", None)
-        # This file contain numa nodes with compute cores
-        has_cpu_path = "/sys/devices/system/node/has_cpu"
         if mem_bind_env:
             nodes = parse_node_list(mem_bind_env)
-        elif os.path.exists(has_cpu_path):
-            with open(has_cpu_path) as f:
-                nodes = parse_node_list(f.read())
-        else:
-            nodes = None
-
-        # Each worker's share of the free memory, including any container limit
-        n_numa_node = len(nodes) if nodes else len(get_cpu_ids_by_node())
-        free_gpu_memory = get_free_cpu_memory() / n_numa_node
-
-        # Nodes can differ in capacity, so also fit within the smallest one
-        if nodes:
+            # CPU bootstrap validates one entry per local scheduler worker.
+            num_workers = len(nodes)
             free_gpu_memory = min(
-                free_gpu_memory,
+                get_free_cpu_memory() / num_workers,
                 min(get_numa_node_available_bytes(n) for n in nodes),
             )
+        else:
+            total_free_memory = get_free_cpu_memory()
+            n_numa_node = len(get_cpu_ids_by_node())
+            free_gpu_memory = round(total_free_memory / n_numa_node, 3)
     elif device == "npu":
         num_gpus = torch.npu.device_count()
         assert gpu_id < num_gpus
